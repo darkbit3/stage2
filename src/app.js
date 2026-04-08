@@ -31,6 +31,16 @@ const services = {
   db_manager: { url: process.env.DB_MANAGER || `http://localhost:${process.env.DB_MANAGER_PORT}`, name: 'DB Manager', connected: false }
 };
 
+// Helper function to extract port from URL
+const getPortFromUrl = (url) => {
+  try {
+    const parsedUrl = new URL(url);
+    return parsedUrl.port || (parsedUrl.protocol === 'https:' ? '443' : '80');
+  } catch (error) {
+    return 'unknown';
+  }
+};
+
 // Enhanced service connection checking with retry logic
 const checkServiceConnections = async () => {
   const maxRetries = 3;
@@ -767,7 +777,7 @@ const displayServiceStatus = async () => {
   let totalCount = Object.keys(services).length;
   
   for (const [key, service] of Object.entries(services)) {
-    const port = service.url.split(':')[2];
+    const port = getPortFromUrl(service.url);
     const status = service.connected ? '✅ CONNECTED' : '❌ DISCONNECTED';
     const statusColor = service.connected ? '\x1b[32m' : '\x1b[31m'; // Green for connected, Red for disconnected
     const reset = '\x1b[0m';
