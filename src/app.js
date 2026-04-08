@@ -595,18 +595,36 @@ function getSampleDataForStage(stage) {
 
   return stageSamples[stage] || stageSamples['e']; // Default to stage E if not found
 }
+
+// Helper function to parse selectedBoard format
+function parseSelectedBoard(selectedBoard) {
+  try {
+    if (!selectedBoard || typeof selectedBoard !== 'string') {
+      return {
+        playerIds: '',
+        boards: '',
+        totalPlayers: 0
+      };
+    }
+
+    const pairs = selectedBoard.split(',');
+    const playerIds = [];
+    const boards = [];
+
+    pairs.forEach(pair => {
+      const [playerId, board] = pair.split(':');
       if (playerId && board) {
         playerIds.push(playerId.trim());
         boards.push(board.trim());
       }
     });
-    
+
     return {
       playerIds: playerIds.join(','),
       boards: boards.join(','),
       totalPlayers: playerIds.length
     };
-    
+
   } catch (error) {
     console.error('Error parsing selectedBoard:', error);
     return {
