@@ -27,8 +27,8 @@ const app = express();
 
 // Service configuration
 const services = {
-  bigserver: { url: `http://localhost:${process.env.BIGSERVER_PORT}`, name: 'Big Server', connected: false },
-  db_manager: { url: `http://localhost:${process.env.DB_MANAGER_PORT}`, name: 'DB Manager', connected: false }
+  bigserver: { url: process.env.BIGSERVER_URL || `http://localhost:${process.env.BIGSERVER_PORT}`, name: 'Big Server', connected: false },
+  db_manager: { url: process.env.DB_MANAGER || `http://localhost:${process.env.DB_MANAGER_PORT}`, name: 'DB Manager', connected: false }
 };
 
 // Enhanced service connection checking with retry logic
