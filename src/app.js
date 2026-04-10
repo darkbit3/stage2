@@ -6,6 +6,7 @@ const winston = require('winston');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 const axios = require('axios');
+const io = require('socket.io-client');
 require('dotenv').config();
 
 // Logger configuration
@@ -30,6 +31,10 @@ const services = {
   bigserver: { url: process.env.BIGSERVER_URL || `http://localhost:${process.env.BIGSERVER_PORT}`, name: 'Big Server', connected: false },
   db_manager: { url: process.env.DB_MANAGER || `http://localhost:${process.env.DB_MANAGER_PORT}`, name: 'DB Manager', connected: false }
 };
+
+// Socket.IO client for real-time connection to DB Manager
+let dbManagerSocket = null;
+let socketConnected = false;
 
 // Helper function to extract port from URL
 const getPortFromUrl = (url) => {
@@ -117,6 +122,102 @@ const checkServiceConnections = async () => {
   }
 };
 
+// Initialize Socket.IO connection to DB Manager
+const initializeSocketConnection = () => {
+  if (dbManagerSocket) {
+    dbManagerSocket.disconnect();
+  }
+
+  console.log('🔌 Connecting to DB Manager via Socket.IO...');
+  logger.info('🔌 Connecting to DB Manager via Socket.IO...');
+
+  dbManagerSocket = io(services.db_manager.url, {
+    transports: ['websocket', 'polling'],
+    timeout: 5000,
+    reconnection: true,
+    reconnectionAttempts: 5,
+    reconnectionDelay: 1000
+  });
+
+  dbManagerSocket.on('connect', () => {
+    console.log('✅ Connected to DB Manager via Socket.IO');
+    logger.info('✅ Connected to DB Manager via Socket.IO');
+    socketConnected = true;
+
+    // Identify as stage2
+    dbManagerSocket.emit('stage2-connect', {
+      stage: 'stage2',
+      timestamp: new Date().toISOString(),
+      port: process.env.PORT
+    });
+  });
+
+  dbManagerSocket.on('db-manager-connected', (data) => {
+    console.log('🎯 DB Manager acknowledged connection:', data);
+    logger.info('🎯 DB Manager acknowledged connection:', data);
+  });
+
+  dbManagerSocket.on('game-data-update', (data) => {
+    console.log('📊 Real-time game data update received:', data);
+    logger.info('📊 Real-time game data update received:', data);
+    // Handle real-time game data updates
+    // This can be used to cache data or notify connected clients
+  });
+
+  dbManagerSocket.on('bet-update', (data) => {
+    console.log('🎯 Real-time bet update received:', data);
+    logger.info('🎯 Real-time bet update received:', data);
+    // Handle real-time bet notifications
+  });
+
+  dbManagerSocket.on('db-status-update', (data) => {
+    console.log('🗄️ Real-time DB status update:', data);
+    logger.info('🗄️ Real-time DB status update:', data);
+  });
+
+  dbManagerSocket.on('connect_error', (error) => {
+    console.log('❌ Socket.IO connection error:', error.message);
+    logger.warn('❌ Socket.IO connection error:', error.message);
+    socketConnected = false;
+  });
+
+  dbManagerSocket.on('disconnect', (reason) => {
+    console.log('🔌 Disconnected from DB Manager:', reason);
+    logger.info('🔌 Disconnected from DB Manager:', reason);
+    socketConnected = false;
+  });
+
+  dbManagerSocket.on('reconnect', (attemptNumber) => {
+    console.log(`🔄 Reconnected to DB Manager after ${attemptNumber} attempts`);
+    logger.info(`🔄 Reconnected to DB Manager after ${attemptNumber} attempts`);
+    socketConnected = true;
+  });
+};
+
+// Request real-time game data
+const requestRealtimeGameData = (stage = 'a') => {
+  if (dbManagerSocket && socketConnected) {
+    console.log(`📊 Requesting real-time game data for Stage ${stage.toUpperCase()}`);
+    logger.info(`📊 Requesting real-time game data for Stage ${stage.toUpperCase()}`);
+    dbManagerSocket.emit('request-game-data', { stage });
+  } else {
+    console.log('⚠️ Socket not connected, cannot request real-time data');
+    logger.warn('⚠️ Socket not connected, cannot request real-time data');
+  }
+};
+
+// Send bet placement notification
+const notifyBetPlaced = (betData) => {
+  if (dbManagerSocket && socketConnected) {
+    console.log('🎯 Sending bet placement notification via Socket.IO');
+    logger.info('🎯 Sending bet placement notification via Socket.IO');
+    dbManagerSocket.emit('bet-placed', betData);
+  } else {
+    console.log('⚠️ Socket not connected, bet notification not sent');
+    logger.warn('⚠️ Socket not connected, bet notification not sent');
+  }
+};
+
 // Enhanced health check with detailed information
 const performHealthCheck = async () => {
   const health = {
@@ -136,7 +237,11 @@ const performHealthCheck = async () => {
         connected: services.db_manager.connected,
         port: process.env.DB_MANAGER_PORT,
         url: services.db_manager.url,
-        lastChecked: new Date().toISOString()
+        lastChecked: new Date().toISOString(),
+        realtime: {
+          socketConnected: socketConnected,
+          socketId: dbManagerSocket ? dbManagerSocket.id : null
+        }
       }
     },
     businessLogic: {
@@ -519,82 +624,26 @@ async function createNewGameForStage(stage) {
     const timestamp = Date.now();
     const gameId = (timestamp % 100000).toString().padStart(5, '0');
 
-    // Create sample game data based on stage
-    const sampleData = getSampleDataForStage(stage);
+    console.log(`🎮 Stage2: No existing game data found for Stage ${stage.toUpperCase()}`);
 
-    console.log(`🎮 Stage2: Creating new game ${gameId} for Stage ${stage.toUpperCase()} with sample data...`);
-
-    // Try to save to DB Manager
-    try {
-      const response = await axios.post(`${services.db_manager.url}/api/v1/stage-${stage}/create`, {
-        gameId: gameId,
-        playerId: sampleData.playerId,
-        selectedBoard: sampleData.selectedBoard,
-        status: 'active',
-        payout: sampleData.payout,
-        amount: sampleData.amount
-      }, {
-        timeout: 10000
-      });
-
-      if (response.data && response.data.success) {
-        console.log(`✅ Stage2: Successfully saved new game ${gameId} to DB Manager`);
-
-        // Parse the saved data
-        const parsedData = parseSelectedBoard(sampleData.selectedBoard);
-
-        return {
-          gameId: gameId,
-          payout: sampleData.payout,
-          players: parsedData.playerIds,
-          boards: parsedData.boards,
-          totalPlayers: parsedData.totalPlayers,
-          stage: stage.toUpperCase(),
-          timestamp: new Date().toISOString()
-        };
-      }
-    } catch (dbError) {
-      console.warn(`⚠️ Stage2: Failed to save to DB Manager, using in-memory data:`, dbError.message);
-    }
-
-    // Fallback: return in-memory generated data
-    const parsedData = parseSelectedBoard(sampleData.selectedBoard);
-
+    // Return empty game state - no sample data
     return {
       gameId: gameId,
-      payout: sampleData.payout,
-      players: parsedData.playerIds,
-      boards: parsedData.boards,
-      totalPlayers: parsedData.totalPlayers,
+      payout: 0,
+      players: [],
+      boards: [],
+      totalPlayers: 0,
       stage: stage.toUpperCase(),
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      message: 'No active game found. Please place bets to start a new game.'
     };
 
   } catch (error) {
-    console.error(`❌ Stage2: Error creating new game for stage ${stage}:`, error.message);
+    console.error(`❌ Stage2: Error creating empty game response for stage ${stage}:`, error.message);
     throw error;
   }
 }
 
-// Helper function to get sample data for different stages
-function getSampleDataForStage(stage) {
-  const stageSamples = {
-    'a': { playerId: '+251909090901,+251909090902', selectedBoard: '+251909090901:15,+251909090902:23', payout: 16, amount: 10 },
-    'b': { playerId: '+251909090903,+251909090904', selectedBoard: '+251909090903:45,+251909090904:67', payout: 16, amount: 10 },
-    'c': { playerId: '+251909090905,+251909090906', selectedBoard: '+251909090905:12,+251909090906:34', payout: 32, amount: 20 },
-    'd': { playerId: '+251909090907,+251909090908', selectedBoard: '+251909090907:56,+251909090908:78', payout: 32, amount: 20 },
-    'e': { playerId: '+251909090909,+251909090910', selectedBoard: '+251909090909:2,+251909090910:4', payout: 48, amount: 30 },
-    'f': { playerId: '+251909090911,+251909090912', selectedBoard: '+251909090911:6,+251909090912:8', payout: 48, amount: 30 },
-    'g': { playerId: '+251909090913,+251909090914', selectedBoard: '+251909090913:10,+251909090914:12', payout: 80, amount: 50 },
-    'h': { playerId: '+251909090915,+251909090916', selectedBoard: '+251909090915:14,+251909090916:16', payout: 80, amount: 50 },
-    'i': { playerId: '+251909090917,+251909090918', selectedBoard: '+251909090917:18,+251909090918:20', payout: 160, amount: 100 },
-    'j': { playerId: '+251909090919,+251909090920', selectedBoard: '+251909090919:22,+251909090920:24', payout: 160, amount: 100 },
-    'k': { playerId: '+251909090921,+251909090922', selectedBoard: '+251909090921:26,+251909090922:28', payout: 320, amount: 200 },
-    'l': { playerId: '+251909090923,+251909090924', selectedBoard: '+251909090923:30,+251909090924:32', payout: 320, amount: 200 }
-  };
-
-  return stageSamples[stage] || stageSamples['e']; // Default to stage E if not found
-}
 
 // Helper function to parse selectedBoard format
 function parseSelectedBoard(selectedBoard) {
@@ -777,6 +826,18 @@ app.post('/api/v1/game/place-bet', async (req, res) => {
         message: 'Bet placed successfully'
       });
       
+      // Step 6: Send real-time notification via Socket.IO
+      notifyBetPlaced({
+        stage: stage.toUpperCase(),
+        gameId: updatedGame.gameId,
+        boardNumber: boardNumber,
+        playerId: playerId,
+        amount: amount,
+        totalPlayers: updatedGame.totalPlayers,
+        payout: updatedGame.payout,
+        timestamp: new Date().toISOString()
+      });
+      
     } catch (updateError) {
       console.error('❌ Stage2: Error updating game:', updateError.message);
       
@@ -865,6 +926,39 @@ app.get('/services', async (req, res) => {
   }
 });
 
+// Real-time connection test endpoint
+app.get('/api/v1/realtime/status', (req, res) => {
+  res.json({
+    success: true,
+    realtime: {
+      socketConnected: socketConnected,
+      socketId: dbManagerSocket ? dbManagerSocket.id : null,
+      dbManagerUrl: services.db_manager.url
+    },
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Request real-time game data endpoint
+app.get('/api/v1/realtime/game-data/:stage?', (req, res) => {
+  const stage = req.params.stage || 'e'; // Stage 2 defaults to stage E
+  
+  if (!socketConnected) {
+    return res.status(503).json({
+      success: false,
+      error: 'Real-time connection not available'
+    });
+  }
+  
+  requestRealtimeGameData(stage);
+  
+  res.json({
+    success: true,
+    message: `Requested real-time game data for Stage ${stage.toUpperCase()}`,
+    timestamp: new Date().toISOString()
+  });
+});
+
 // Error handling middleware
 app.use((err, req, res, next) => {
   logger.error(err.stack);
@@ -933,10 +1027,18 @@ app.listen(PORT, async () => {
   // Display initial service status
   await displayServiceStatus();
   
+  // Initialize Socket.IO connection to DB Manager
+  initializeSocketConnection();
+  
   // Check services every 10 seconds for better real-time updates
   setInterval(async () => {
     console.log('\n🔄 Checking service connections...');
     await checkServiceConnections();
+  }, 10000);
+  
+  // Request initial game data every 10 seconds
+  setInterval(() => {
+    requestRealtimeGameData('e'); // Stage 2 defaults to stage E
   }, 10000);
 });
 
