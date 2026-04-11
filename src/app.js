@@ -123,20 +123,33 @@ const checkServiceConnections = async () => {
       };
 
       try {
-        const dbManagerResult = await tryUrl(services.db_manager.primaryUrl);
-        console.log('✅ Connected to DB Manager on local port ' + process.env.DB_MANAGER_PORT);
-        return dbManagerResult;
-      } catch (localError) {
-        console.warn('⚠️ Local DB Manager failed on port ' + process.env.DB_MANAGER_PORT + ', falling back to remote DB Manager URL:', services.db_manager.fallbackUrl);
-        logger.warn(`⚠️ Local DB Manager connection failed, switching to fallback URL ${services.db_manager.fallbackUrl}`);
-
-        try {
+        // Skip local connection if USE_REMOTE_DB is set to true
+        if (process.env.USE_REMOTE_DB === 'true') {
+          console.log('🔄 USE_REMOTE_DB is true, skipping local DB Manager connection');
           const dbManagerResult = await tryUrl(services.db_manager.fallbackUrl);
-          console.log('✅ Connected to DB Manager via remote fallback');
-          logger.info(`✅ DB Manager connected via remote fallback URL ${services.db_manager.fallbackUrl}`);
+          console.log('✅ Connected to DB Manager via remote URL');
+          logger.info(`✅ DB Manager connected via remote URL ${services.db_manager.fallbackUrl}`);
           return dbManagerResult;
-        } catch (remoteError) {
-          throw remoteError;
+        } else {
+          const dbManagerResult = await tryUrl(services.db_manager.primaryUrl);
+          console.log('✅ Connected to DB Manager on local port ' + process.env.DB_MANAGER_PORT);
+          return dbManagerResult;
+        }
+      } catch (localError) {
+        if (process.env.USE_REMOTE_DB !== 'true') {
+          console.warn('⚠️ Local DB Manager failed on port ' + process.env.DB_MANAGER_PORT + ', falling back to remote DB Manager URL:', services.db_manager.fallbackUrl);
+          logger.warn(`⚠️ Local DB Manager connection failed, switching to fallback URL ${services.db_manager.fallbackUrl}`);
+
+          try {
+            const dbManagerResult = await tryUrl(services.db_manager.fallbackUrl);
+            console.log('✅ Connected to DB Manager via remote fallback');
+            logger.info(`✅ DB Manager connected via remote fallback URL ${services.db_manager.fallbackUrl}`);
+            return dbManagerResult;
+          } catch (remoteError) {
+            throw remoteError;
+          }
+        } else {
+          throw localError;
         }
       }
     };
