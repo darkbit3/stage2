@@ -2,11 +2,13 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
+const http = require('http');
+const socketIo = require('socket.io');
 const winston = require('winston');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 const axios = require('axios');
-const io = require('socket.io-client');
+const ioClient = require('socket.io-client');
 require('dotenv').config();
 
 // Logger configuration
@@ -25,11 +27,30 @@ const logger = winston.createLogger({
 });
 
 const app = express();
+const server = http.createServer(app);
+
+// Socket.IO server for Big Server connections
+const io = socketIo(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
+});
 
 // Service configuration
+const DB_MANAGER_LOCAL_URL = `http://localhost:${process.env.DB_MANAGER_PORT || 3007}`;
+const DB_MANAGER_REMOTE_URL = process.env.DB_MANAGER || 'https://db-manager-1.onrender.com';
+
 const services = {
   bigserver: { url: process.env.BIGSERVER_URL || `http://localhost:${process.env.BIGSERVER_PORT}`, name: 'Big Server', connected: false },
-  db_manager: { url: process.env.DB_MANAGER || `http://localhost:${process.env.DB_MANAGER_PORT}`, name: 'DB Manager', connected: false }
+  db_manager: {
+    primaryUrl: DB_MANAGER_LOCAL_URL,
+    fallbackUrl: DB_MANAGER_REMOTE_URL,
+    url: DB_MANAGER_LOCAL_URL,
+    name: 'DB Manager',
+    connected: false,
+    fallbackUsed: false
+  }
 };
 
 // Socket.IO client for real-time connection to DB Manager
@@ -92,19 +113,43 @@ const checkServiceConnections = async () => {
     }
 
     // Check DB Manager connection
+    const checkDbManagerConnection = async () => {
+      const tryUrl = async (url) => {
+        const result = await checkWithRetry('DB Manager', url);
+        services.db_manager.url = url;
+        services.db_manager.connected = true;
+        services.db_manager.fallbackUsed = url !== services.db_manager.primaryUrl;
+        return result;
+      };
+
+      try {
+        const dbManagerResult = await tryUrl(services.db_manager.primaryUrl);
+        console.log('✅ Connected to DB Manager on local port ' + process.env.DB_MANAGER_PORT);
+        return dbManagerResult;
+      } catch (localError) {
+        console.warn('⚠️ Local DB Manager failed on port ' + process.env.DB_MANAGER_PORT + ', falling back to remote DB Manager URL:', services.db_manager.fallbackUrl);
+        logger.warn(`⚠️ Local DB Manager connection failed, switching to fallback URL ${services.db_manager.fallbackUrl}`);
+
+        try {
+          const dbManagerResult = await tryUrl(services.db_manager.fallbackUrl);
+          console.log('✅ Connected to DB Manager via remote fallback');
+          logger.info(`✅ DB Manager connected via remote fallback URL ${services.db_manager.fallbackUrl}`);
+          return dbManagerResult;
+        } catch (remoteError) {
+          throw remoteError;
+        }
+      }
+    };
+
     try {
-      const dbManagerResult = await checkWithRetry('DB Manager', services.db_manager.url);
-      
-      services.db_manager.connected = true;
-      console.log('✅ Connected to DB Manager (Port ' + process.env.DB_MANAGER_PORT + ')');
+      const dbManagerResult = await checkDbManagerConnection();
       console.log('   📊 DB Manager Status:', dbManagerResult.data.status);
       console.log('   🗄️  Database Status:', dbManagerResult.data.databases?.sqlite?.status || 'Unknown');
-      logger.info(`✅ DB Manager (Port ${process.env.DB_MANAGER_PORT}) is connected`);
-      
+      logger.info(`✅ DB Manager is connected using URL ${services.db_manager.url}`);
     } catch (error) {
       services.db_manager.connected = false;
-      console.log('❌ Failed to connect to DB Manager (Port ' + process.env.DB_MANAGER_PORT + '):', error.message);
-      logger.warn(`❌ DB Manager (Port ${process.env.DB_MANAGER_PORT}) connection error: ${error.message}`);
+      console.log('❌ Failed to connect to DB Manager:', error.message);
+      logger.warn(`❌ DB Manager connection error: ${error.message}`);
     }
     
     // Enhanced connection summary
@@ -131,7 +176,7 @@ const initializeSocketConnection = () => {
   console.log('🔌 Connecting to DB Manager via Socket.IO...');
   logger.info('🔌 Connecting to DB Manager via Socket.IO...');
 
-  dbManagerSocket = io(services.db_manager.url, {
+  dbManagerSocket = ioClient(services.db_manager.url, {
     transports: ['websocket', 'polling'],
     timeout: 5000,
     reconnection: true,
@@ -179,6 +224,14 @@ const initializeSocketConnection = () => {
     console.log('❌ Socket.IO connection error:', error.message);
     logger.warn('❌ Socket.IO connection error:', error.message);
     socketConnected = false;
+
+    if (!services.db_manager.fallbackUsed && services.db_manager.url === services.db_manager.primaryUrl) {
+      console.log('⚠️ Socket connection to local DB Manager failed, switching to remote fallback...');
+      services.db_manager.url = services.db_manager.fallbackUrl;
+      services.db_manager.fallbackUsed = true;
+      dbManagerSocket.disconnect();
+      initializeSocketConnection();
+    }
   });
 
   dbManagerSocket.on('disconnect', (reason) => {
@@ -195,15 +248,44 @@ const initializeSocketConnection = () => {
 };
 
 // Request real-time game data
-const requestRealtimeGameData = (stage = 'a') => {
+const requestRealtimeGameData = async (stage = 'a') => {
   if (dbManagerSocket && socketConnected) {
     console.log(`📊 Requesting real-time game data for Stage ${stage.toUpperCase()}`);
     logger.info(`📊 Requesting real-time game data for Stage ${stage.toUpperCase()}`);
     dbManagerSocket.emit('request-game-data', { stage });
-  } else {
-    console.log('⚠️ Socket not connected, cannot request real-time data');
-    logger.warn('⚠️ Socket not connected, cannot request real-time data');
+    return;
   }
+
+  if (services.db_manager.connected) {
+    try {
+      console.log('⚠️ Socket not connected, falling back to HTTP request for real-time game data');
+      logger.warn('⚠️ Socket not connected, falling back to HTTP request for real-time game data');
+
+      const response = await axios.get(`${services.db_manager.url}/api/v1/stage-${stage}/last-game-id`, {
+        timeout: 10000
+      });
+
+      if (response.data && response.data.success) {
+        console.log(`✅ HTTP fallback game data received for Stage ${stage.toUpperCase()}`);
+        logger.info(`✅ HTTP fallback game data received for Stage ${stage.toUpperCase()}`, response.data.data);
+        io.emit('game-data-update', {
+          stage: stage.toUpperCase(),
+          data: response.data.data,
+          timestamp: new Date().toISOString(),
+          source: 'db_manager_http_fallback'
+        });
+      } else {
+        console.warn('⚠️ HTTP fallback request returned invalid data');
+      }
+    } catch (error) {
+      console.error('❌ HTTP fallback failed for real-time game data:', error.message);
+      logger.error('❌ HTTP fallback failed for real-time game data:', error.message);
+    }
+    return;
+  }
+
+  console.log('⚠️ No DB Manager connection available for real-time game data');
+  logger.warn('⚠️ No DB Manager connection available for real-time game data');
 };
 
 // Send bet placement notification
@@ -215,6 +297,119 @@ const notifyBetPlaced = (betData) => {
   } else {
     console.log('⚠️ Socket not connected, bet notification not sent');
     logger.warn('⚠️ Socket not connected, bet notification not sent');
+  }
+};
+
+// Process bet function for WebSocket requests
+const processBet = async (betData) => {
+  const { boardNumber, playerId, amount, stage } = betData;
+
+  console.log(`🎯 Stage2 WebSocket: Processing bet - Board: ${boardNumber}, Player: ${playerId}, Amount: ${amount}, Stage: ${stage}`);
+  logger.info(`🎯 Stage2 WebSocket: Processing bet - Board: ${boardNumber}, Player: ${playerId}, Amount: ${amount}, Stage: ${stage}`);
+
+  // Validate input
+  if (!boardNumber || !playerId || !amount || !stage) {
+    throw new Error('Missing required fields: boardNumber, playerId, amount, stage');
+  }
+
+  // Validate board number range
+  if (boardNumber < 1 || boardNumber > 400) {
+    throw new Error('Board number must be between 1 and 400');
+  }
+
+  // Step 1: Check player balance with BigServer
+  console.log(`💰 Stage2 WebSocket: Checking balance for player ${playerId}...`);
+  let balanceResponse;
+  try {
+    balanceResponse = await axios.get(`${services.bigserver.url}/api/v1/player/balance/${playerId}`, {
+      timeout: 10000,
+      headers: {
+        'Authorization': `Bearer ${process.env.BIGSERVER_API_KEY}`,
+        'X-API-Key': process.env.BIGSERVER_API_KEY
+      }
+    });
+  } catch (balanceError) {
+    console.error('❌ Stage2 WebSocket: Error checking balance:', balanceError.message);
+    logger.error('❌ Stage2 WebSocket: Error checking balance:', balanceError.message);
+    throw new Error('Failed to check player balance');
+  }
+
+  if (!balanceResponse.data || !balanceResponse.data.success) {
+    throw new Error('Unable to verify player balance');
+  }
+
+  const playerBalance = balanceResponse.data.balance;
+  console.log(`💰 Stage2 WebSocket: Player balance: ${playerBalance}, Bet amount: ${amount}`);
+
+  // Step 2: Validate sufficient balance
+  if (playerBalance < amount) {
+    throw new Error('Insufficient balance');
+  }
+
+  // Step 3: Deduct balance from BigServer
+  console.log(`💸 Stage2 WebSocket: Deducting ${amount} from player ${playerId}...`);
+  try {
+    await axios.post(`${services.bigserver.url}/api/v1/player/deduct`, {
+      playerId: playerId,
+      amount: amount
+    }, {
+      timeout: 10000,
+      headers: {
+        'Authorization': `Bearer ${process.env.BIGSERVER_API_KEY}`,
+        'X-API-Key': process.env.BIGSERVER_API_KEY,
+        'Content-Type': 'application/json'
+      }
+    });
+  } catch (deductError) {
+    console.error('❌ Stage2 WebSocket: Error deducting balance:', deductError.message);
+    logger.error('❌ Stage2 WebSocket: Error deducting balance:', deductError.message);
+    throw new Error('Failed to deduct balance');
+  }
+
+  // Step 4: Update game in DB Manager
+  console.log(`🗄️ Stage2 WebSocket: Updating game ${stage} with new bet...`);
+  try {
+    const updateResponse = await axios.put(`${services.db_manager.url}/api/v1/stage-${stage.toLowerCase()}/update-game`, {
+      newPlayerId: playerId,
+      newBoardNumber: boardNumber,
+      amount: amount
+    }, {
+      timeout: 10000,
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    });
+
+    if (!updateResponse.data || !updateResponse.data.success) {
+      const error = updateResponse.data?.error || 'Failed to update game';
+
+      // Check if this is a 2-board limit error
+      if (error.includes('maximum limit of 2 boards')) {
+        throw new Error(`Board limit reached: ${error}`);
+      }
+
+      throw new Error(error);
+    }
+
+    const updatedGame = updateResponse.data.data;
+    console.log(`✅ Stage2 WebSocket: Game updated successfully - Game ID: ${updatedGame.gameId}, New Players: ${updatedGame.totalPlayers}`);
+    logger.info(`✅ Stage2 WebSocket: Game updated successfully - Game ID: ${updatedGame.gameId}, New Players: ${updatedGame.totalPlayers}`);
+
+    return {
+      betId: `${updatedGame.gameId}-${playerId}-${boardNumber}`,
+      gameId: updatedGame.gameId,
+      boardNumber: boardNumber,
+      playerId: playerId,
+      amount: amount,
+      newBalance: playerBalance - amount,
+      updatedGame: updatedGame,
+      timestamp: new Date().toISOString()
+    };
+
+  } catch (updateError) {
+    console.error('❌ Stage2 WebSocket: Error updating game:', updateError.message);
+    logger.error('❌ Stage2 WebSocket: Error updating game:', updateError.message);
+    throw new Error(`Failed to update game: ${updateError.message}`);
   }
 };
 
@@ -278,6 +473,62 @@ const performHealthCheck = async () => {
   
   return health;
 };
+
+// Socket.IO server event handlers for Big Server connections
+io.on('connection', (socket) => {
+  console.log('🔗 Big Server connected via WebSocket:', socket.id);
+  logger.info('🔗 Big Server connected via WebSocket:', socket.id);
+
+  socket.on('bet-request', async (data) => {
+    console.log('🎯 Received bet request from Big Server:', data);
+    logger.info('🎯 Received bet request from Big Server:', data);
+
+    try {
+      // Process the bet through existing logic
+      const betResult = await processBet(data);
+
+      // Send response back to Big Server
+      socket.emit('bet-response', {
+        success: true,
+        betId: betResult.betId,
+        result: betResult,
+        timestamp: new Date().toISOString()
+      });
+
+      // Notify DB Manager of the bet
+      notifyBetPlaced({
+        ...data,
+        stage: 'stage2',
+        processedAt: new Date().toISOString()
+      });
+
+    } catch (error) {
+      console.error('❌ Error processing bet:', error);
+      logger.error('❌ Error processing bet:', error);
+      socket.emit('bet-response', {
+        success: false,
+        error: error.message,
+        timestamp: new Date().toISOString()
+      });
+    }
+  });
+
+  socket.on('game-status-request', (data) => {
+    console.log('📊 Game status request from Big Server:', data);
+    logger.info('📊 Game status request from Big Server:', data);
+    // Send current game status
+    socket.emit('game-status-response', {
+      stage: 'stage2',
+      status: 'active',
+      timestamp: new Date().toISOString()
+    });
+  });
+
+  socket.on('disconnect', () => {
+    console.log('🔌 Big Server disconnected from WebSocket');
+    logger.info('🔌 Big Server disconnected from WebSocket');
+  });
+});
 
 // Middleware
 app.use(helmet());
@@ -793,7 +1044,7 @@ app.post('/api/v1/game/place-bet', async (req, res) => {
     // Step 4: Update game in DB Manager
     console.log(`🗄️ Stage2: Updating game ${stage} with new bet...`);
     try {
-      const updateResponse = await axios.put(`${DB_MANAGER_URL}/api/v1/stage-${stage.toLowerCase()}/update-game`, {
+const updateResponse = await axios.put(`${services.db_manager.url}/api/v1/stage-${stage.toLowerCase()}/update-game`, {
         newPlayerId: playerId,
         newBoardNumber: boardNumber,
         amount: amount
@@ -1019,7 +1270,7 @@ const displayServiceStatus = async () => {
 };
 
 // Start server and check connections
-app.listen(PORT, async () => {
+server.listen(PORT, async () => {
   logger.info(`🚀 Stage 2 Backend API is running on port ${PORT}`);
   logger.info(`📋 Health Check: http://localhost:${PORT}/health`);
   logger.info(`🔗 Services Status: http://localhost:${PORT}/services`);
